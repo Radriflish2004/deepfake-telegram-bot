@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Protocol
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -19,6 +20,13 @@ from app.services.deepfake_service import DeepfakeService
 from app.utils.files import safe_suffix, unique_file_path
 
 logger = logging.getLogger(__name__)
+
+
+class TelegramFileCarrier(Protocol):
+    file_size: int | None
+    file_name: str | None
+
+    async def get_file(self): ...
 
 
 class BotHandlers:
@@ -51,18 +59,33 @@ class BotHandlers:
             return
 
         document = update.message.document
+        await self._handle_media_file(update, document, default_suffix=".bin")
+
+    async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message or not update.message.video:
+            return
+
+        await self._handle_media_file(update, update.message.video, default_suffix=".mp4")
+
+    async def _handle_media_file(
+        self,
+        update: Update,
+        media: TelegramFileCarrier,
+        default_suffix: str,
+    ) -> None:
+        assert update.message is not None
 
         max_bytes = self.settings.max_file_size_mb * 1024 * 1024
-        if document.file_size and document.file_size > max_bytes:
+        if media.file_size and media.file_size > max_bytes:
             await update.message.reply_text(TOO_LARGE_MESSAGE)
             return
 
-        suffix = safe_suffix(document.file_name, ".bin")
+        suffix = safe_suffix(media.file_name, default_suffix)
         if suffix not in (self.service.IMAGE_EXTS | self.service.VIDEO_EXTS):
             await update.message.reply_text(UNSUPPORTED_MESSAGE)
             return
 
-        file_info = await document.get_file()
+        file_info = await media.get_file()
         temp_path = unique_file_path(self.settings.temp_dir, suffix)
         await file_info.download_to_drive(custom_path=str(temp_path))
 

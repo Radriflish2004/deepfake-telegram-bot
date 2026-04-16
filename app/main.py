@@ -48,6 +48,7 @@ def run() -> None:
     app.add_handler(CommandHandler("help", handlers.help_command))
 
     app.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
+    app.add_handler(MessageHandler(filters.VIDEO, handlers.handle_video))
     app.add_handler(
         MessageHandler(
             filters.Document.IMAGE | filters.Document.VIDEO,
