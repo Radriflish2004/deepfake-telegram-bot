@@ -36,6 +36,39 @@ class AnalyzeResult:
     output_path: Path | None
 
 
+@dataclass
+class VideoFacePrediction:
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    det_conf: float
+    label: int
+    confidence: float
+    prob_real: float
+    prob_fake: float
+
+
+@dataclass
+class VideoFrameAnalysis:
+    frame_idx: int
+    timestamp_sec: float
+    predictions: list[VideoFacePrediction]
+    frame_fake_score: float
+
+
+@dataclass
+class VideoAggregate:
+    verdict: str
+    overall_fake_score: float
+    mean_fake_score: float
+    peak_fake_score: float
+    fake_frame_ratio: float
+    suspicious_streak_sec: float
+    fake_frames: int
+    real_frames: int
+
+
 def generate_anchors(input_size: int = 256) -> np.ndarray:
     strides = [16, 32]
     anchors_per_cell = [2, 6]
@@ -395,45 +428,25 @@ class DeepfakeService:
         output_path = self.results_dir / f"{video_path.stem}_result.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-
-        results = []
-        frame_idx = 0
         start_time = time.time()
 
+        analyzed_frames = self._extract_video_frames(cap, fps)
+        frame_map = {analysis.frame_idx: analysis for analysis in analyzed_frames}
+
+        cap.release()
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            writer.release()
+            raise ValueError("Не удалось повторно открыть видео для сборки результата")
+
+        frame_idx = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            if frame_idx % self.frame_skip == 0:
-                faces = self.face_detector.detect(frame)
-
-                for face in faces:
-                    x1, y1, x2, y2, det_conf = face
-                    face_crop = frame[y1:y2, x1:x2]
-                    if face_crop.size == 0:
-                        continue
-
-                    label, confidence, prob_real, prob_fake = self.deepfake_classifier.classify(face_crop)
-                    results.append((frame_idx, label, confidence, prob_real, prob_fake))
-
-                    color = (0, 255, 0) if label == 0 else (0, 0, 255)
-                    label_text = "REAL" if label == 0 else "FAKE"
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-                    text = f"{label_text} {confidence:.1f}%"
-                    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                    top_y = max(y1 - th - 10, 0)
-                    cv2.rectangle(frame, (x1, top_y), (x1 + tw, y1), color, -1)
-                    cv2.putText(
-                        frame,
-                        text,
-                        (x1, max(y1 - 5, 0)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                    )
+            if frame_idx in frame_map:
+                self._annotate_video_frame(frame, frame_map[frame_idx])
 
             writer.write(frame)
             frame_idx += 1
@@ -441,7 +454,8 @@ class DeepfakeService:
         cap.release()
         writer.release()
 
-        if not results:
+        frames_with_faces = [frame for frame in analyzed_frames if frame.predictions]
+        if not frames_with_faces:
             return AnalyzeResult(
                 input_type="video",
                 faces_count=0,
@@ -450,28 +464,212 @@ class DeepfakeService:
                 output_path=output_path,
             )
 
-        fake_count = sum(1 for r in results if r[1] == 1)
-        real_count = sum(1 for r in results if r[1] == 0)
-        verdict = "fake" if fake_count > real_count else "real"
-
+        aggregate = self._aggregate_video_predictions(frames_with_faces, fps)
+        all_predictions = [prediction for frame in frames_with_faces for prediction in frame.predictions]
+        avg_real = float(np.mean([prediction.prob_real for prediction in all_predictions]))
+        avg_fake = float(np.mean([prediction.prob_fake for prediction in all_predictions]))
         elapsed = time.time() - start_time
-        avg_real = float(np.mean([r[3] for r in results]))
-        avg_fake = float(np.mean([r[4] for r in results]))
 
-        summary = (
-            f"Видео обработано за {elapsed:.1f} сек.\n"
-            f"Кадров всего: {total_frames}\n"
-            f"Обнаружений лиц: {len(results)}\n"
-            f"Real: {real_count}\n"
-            f"Fake: {fake_count}\n"
-            f"Средний real: {avg_real:.1f}%\n"
-            f"Средний fake: {avg_fake:.1f}%"
-        )
+        suspicious_frames = sorted(
+            frames_with_faces,
+            key=lambda frame: frame.frame_fake_score,
+            reverse=True,
+        )[:3]
+
+        summary_lines = [
+            f"Видео обработано за {elapsed:.1f} сек.",
+            f"Кадров всего: {total_frames}",
+            f"Кадров проанализировано: {len(analyzed_frames)} (каждый {self.frame_skip}-й)",
+            f"Кадров с лицами: {len(frames_with_faces)}",
+            f"Обнаружений лиц: {len(all_predictions)}",
+            f"Итоговый fake score: {aggregate.overall_fake_score * 100:.1f}%",
+            f"Средний fake score по кадрам: {aggregate.mean_fake_score * 100:.1f}%",
+            f"Пиковый fake score кадра: {aggregate.peak_fake_score * 100:.1f}%",
+            f"Подозрительных кадров: {aggregate.fake_frames}",
+            f"Стабильно подозрительный фрагмент: {aggregate.suspicious_streak_sec:.2f} сек.",
+            f"Средний real: {avg_real:.1f}%",
+            f"Средний fake: {avg_fake:.1f}%",
+        ]
+
+        if suspicious_frames:
+            summary_lines.append("")
+            summary_lines.append("Самые подозрительные кадры:")
+            for frame in suspicious_frames:
+                summary_lines.append(
+                    f"- кадр {frame.frame_idx} ({frame.timestamp_sec:.2f} сек): "
+                    f"fake score {frame.frame_fake_score * 100:.1f}% | лиц {len(frame.predictions)}"
+                )
 
         return AnalyzeResult(
             input_type="video",
-            faces_count=len(results),
-            verdict=verdict,
-            summary_text=summary,
+            faces_count=len(all_predictions),
+            verdict=aggregate.verdict,
+            summary_text="\n".join(summary_lines),
             output_path=output_path,
+        )
+
+    def _extract_video_frames(self, cap: cv2.VideoCapture, fps: float) -> list[VideoFrameAnalysis]:
+        analyzed_frames: list[VideoFrameAnalysis] = []
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % self.frame_skip == 0:
+                analyzed_frames.append(self._analyze_video_frame(frame, frame_idx, fps))
+
+            frame_idx += 1
+
+        return analyzed_frames
+
+    def _analyze_video_frame(self, frame: np.ndarray, frame_idx: int, fps: float) -> VideoFrameAnalysis:
+        faces = self.face_detector.detect(frame)
+        predictions: list[VideoFacePrediction] = []
+
+        for face in faces:
+            x1, y1, x2, y2, det_conf = face
+            face_crop = frame[y1:y2, x1:x2]
+            if face_crop.size == 0:
+                continue
+
+            label, confidence, prob_real, prob_fake = self.deepfake_classifier.classify(face_crop)
+            predictions.append(
+                VideoFacePrediction(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    det_conf=det_conf,
+                    label=label,
+                    confidence=confidence,
+                    prob_real=prob_real,
+                    prob_fake=prob_fake,
+                )
+            )
+
+        frame_fake_score = self._score_video_frame(predictions)
+        return VideoFrameAnalysis(
+            frame_idx=frame_idx,
+            timestamp_sec=frame_idx / fps if fps > 0 else 0.0,
+            predictions=predictions,
+            frame_fake_score=frame_fake_score,
+        )
+
+    def _score_video_frame(self, predictions: list[VideoFacePrediction]) -> float:
+        if not predictions:
+            return 0.0
+
+        weighted_scores = []
+        for prediction in predictions:
+            model_conf = prediction.confidence / 100.0
+            fake_prob = prediction.prob_fake / 100.0
+            weighted_scores.append(fake_prob * (0.55 + 0.45 * model_conf) * prediction.det_conf)
+
+        peak_score = max(weighted_scores)
+        mean_score = float(np.mean(weighted_scores))
+        return float(np.clip(0.65 * peak_score + 0.35 * mean_score, 0.0, 1.0))
+
+    def _aggregate_video_predictions(
+        self,
+        frames_with_faces: list[VideoFrameAnalysis],
+        fps: float,
+    ) -> VideoAggregate:
+        frame_scores = [frame.frame_fake_score for frame in frames_with_faces]
+        mean_fake_score = float(np.mean(frame_scores))
+        peak_fake_score = float(np.max(frame_scores))
+        suspicious_threshold = 0.55
+
+        fake_frames = sum(1 for score in frame_scores if score >= suspicious_threshold)
+        real_frames = len(frame_scores) - fake_frames
+        fake_frame_ratio = fake_frames / len(frame_scores)
+        suspicious_streak = self._max_suspicious_streak(frames_with_faces, suspicious_threshold, fps)
+
+        top_count = max(1, int(np.ceil(len(frame_scores) * 0.3)))
+        top_mean = float(np.mean(sorted(frame_scores, reverse=True)[:top_count]))
+        streak_score = min(suspicious_streak / 1.5, 1.0)
+
+        overall_fake_score = float(
+            np.clip(
+                0.40 * mean_fake_score
+                + 0.30 * top_mean
+                + 0.20 * fake_frame_ratio
+                + 0.10 * streak_score,
+                0.0,
+                1.0,
+            )
+        )
+
+        strong_peak = peak_fake_score >= 0.85 and fake_frame_ratio >= 0.20
+        consistent_fake = overall_fake_score >= 0.58 or (overall_fake_score >= 0.52 and suspicious_streak >= 1.0)
+        verdict = "fake" if strong_peak or consistent_fake else "real"
+
+        return VideoAggregate(
+            verdict=verdict,
+            overall_fake_score=overall_fake_score,
+            mean_fake_score=mean_fake_score,
+            peak_fake_score=peak_fake_score,
+            fake_frame_ratio=fake_frame_ratio,
+            suspicious_streak_sec=suspicious_streak,
+            fake_frames=fake_frames,
+            real_frames=real_frames,
+        )
+
+    def _max_suspicious_streak(
+        self,
+        frames_with_faces: list[VideoFrameAnalysis],
+        suspicious_threshold: float,
+        fps: float,
+    ) -> float:
+        if not frames_with_faces or fps <= 0:
+            return 0.0
+
+        longest = 0
+        current = 0
+        expected_step = max(1, self.frame_skip)
+        previous_idx: int | None = None
+
+        for frame in frames_with_faces:
+            is_consecutive = previous_idx is not None and frame.frame_idx - previous_idx == expected_step
+            if frame.frame_fake_score >= suspicious_threshold:
+                current = current + 1 if is_consecutive else 1
+                longest = max(longest, current)
+            else:
+                current = 0
+
+            previous_idx = frame.frame_idx
+
+        return longest * expected_step / fps
+
+    def _annotate_video_frame(self, frame: np.ndarray, analysis: VideoFrameAnalysis) -> None:
+        for prediction in analysis.predictions:
+            color = (0, 255, 0) if prediction.label == 0 else (0, 0, 255)
+            label_text = "REAL" if prediction.label == 0 else "FAKE"
+
+            cv2.rectangle(frame, (prediction.x1, prediction.y1), (prediction.x2, prediction.y2), color, 2)
+            text = f"{label_text} {prediction.confidence:.1f}%"
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            top_y = max(prediction.y1 - th - 10, 0)
+            cv2.rectangle(frame, (prediction.x1, top_y), (prediction.x1 + tw, prediction.y1), color, -1)
+            cv2.putText(
+                frame,
+                text,
+                (prediction.x1, max(prediction.y1 - 5, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+
+        banner_text = f"Fake score: {analysis.frame_fake_score * 100:.1f}%"
+        cv2.rectangle(frame, (10, 10), (310, 50), (20, 20, 20), -1)
+        cv2.putText(
+            frame,
+            banner_text,
+            (20, 38),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
         )
