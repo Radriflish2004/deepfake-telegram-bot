@@ -1,0 +1,5 @@
+python-telegram-bot==21.10
+opencv-python==4.10.0.84
+numpy==1.26.4
+onnxruntime==1.19.2
+python-dotenv==1.0.1
