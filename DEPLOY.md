@@ -76,6 +76,7 @@ Edit `.env` and set at least:
 
 ```env
 BOT_TOKEN=your_real_bot_token
+DATABASE_URL=postgresql://user:password@host:port/database
 TEMP_DIR=./temp
 RESULTS_DIR=./results
 MODELS_DIR=./models

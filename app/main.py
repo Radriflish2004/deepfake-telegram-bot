@@ -18,6 +18,7 @@ from telegram.ext import (
 
 from app.bot.handlers import BotHandlers
 from app.config import get_settings
+from app.database import Database
 from app.services.deepfake_service import DeepfakeService
 
 
@@ -32,6 +33,12 @@ def run() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
 
+    db = None
+    if settings.database_url:
+        db = Database(settings.database_url)
+        db.create_tables()
+        logging.getLogger(__name__).info("Database tables are ready")
+
     service = DeepfakeService(
         face_model_path=settings.face_model_path,
         deepfake_model_path=settings.deepfake_model_path,
@@ -40,7 +47,7 @@ def run() -> None:
         frame_skip=settings.video_frame_skip,
     )
 
-    handlers = BotHandlers(settings=settings, service=service)
+    handlers = BotHandlers(settings=settings, service=service, db=db)
 
     app = Application.builder().token(settings.bot_token).build()
 

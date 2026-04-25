@@ -12,6 +12,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
+    database_url: str | None
     temp_dir: Path
     results_dir: Path
     models_dir: Path
@@ -51,6 +52,7 @@ def get_settings() -> Settings:
 
     return Settings(
         bot_token=bot_token,
+        database_url=os.getenv("DATABASE_URL", "").strip() or None,
         temp_dir=temp_dir,
         results_dir=results_dir,
         models_dir=models_dir,
